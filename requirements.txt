@@ -7,3 +7,6 @@ requests
 httpx
 numpy
 python-dateutil
+duckdb
+python-dotenv
+pytesseract

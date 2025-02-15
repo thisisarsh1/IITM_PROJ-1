@@ -12,6 +12,8 @@ import pytesseract
 from PIL import Image
 import numpy as np
 import sqlite3
+import duckdb
+from typing import Optional, Dict, Any
 import base64
 from dotenv import load_dotenv
 last_user_instruction = ""
@@ -58,6 +60,30 @@ async def run_task(task: str = Query(...)):
             result = handle_task_A9()
         elif task_code == "A10":
             result = handle_task_A10()
+        elif task_code == "B1":
+            result = handle_task_B1(
+                parsed_task['url'],
+                parsed_task['output_file'],
+                parsed_task.get('params')
+            )
+        elif task_code == "B2":
+            result = handle_task_B2(
+                parsed_task['repo_url'],
+                parsed_task['output_dir'],
+                parsed_task['commit_msg']
+            )
+        elif task_code == "B3":
+            result = handle_task_B3(
+                parsed_task['database_file'],
+                parsed_task['query'],
+                parsed_task['output_file'],
+                parsed_task.get('is_sqlite', True)
+            )
+        elif task_code == "B4":
+            result = handle_task_B4(
+                parsed_task['url'],
+                parsed_task['output_file']
+            )
         else:
             raise Exception("Unrecognized or unsupported task code returned by LLM.")
         
@@ -149,11 +175,11 @@ def handle_task_A1(user_email: str):
 
 def handle_task_A2():
     """
-    Formats the file /data/format.md using prettier@3.4.2.
+    Formats the file data/format.md using prettier@3.4.2.
     The file is updated in-place.
     
     This version mimics the evaluation script: it pipes the file content into Prettier
-    using the "--stdin-filepath /data/format.md" option.
+    using the "--stdin-filepath data/format.md" option.
     """
     # Define the local data directory (project-root/data)
     local_data_dir = os.path.join(os.getcwd(), "data")
@@ -171,7 +197,7 @@ def handle_task_A2():
     
     try:
         # Build the command as a single string.
-        cmd = "npx prettier@3.4.2 --stdin-filepath /data/format.md"
+        cmd = "npx prettier@3.4.2 --stdin-filepath data/format.md"
         # Run Prettier using the command string, passing the current working directory and environment.
         proc = subprocess.run(
             cmd,
@@ -680,7 +706,66 @@ def handle_task_A10():
 
     except Exception as e:
         return {"error": str(e)}
+def handle_task_B1(url: str, output_file: str, params: Optional[Dict[str, Any]] = None):
+    """Execute API request and save response"""
+    try:
+        if params and 'headers' in params:  # POST
+            response = requests.post(url, 
+                                   headers=params.get('headers'), 
+                                   data=params.get('data'))
+        else:  # GET
+            response = requests.get(url, params=params)
+            
+        response.raise_for_status()
+        with open(os.path.join('data', output_file), 'w') as f:
+            json.dump(response.json(), f)
+        return {"status": "success"}
+    except requests.RequestException as e:
+        return {"error": f"API request failed: {str(e)}"}
 
+def handle_task_B2(repo_url: str, output_dir: str, commit_msg: str):
+    """Git repository operations"""
+    try:
+        subprocess.run(['git', 'clone', repo_url, output_dir], check=True)
+        subprocess.run(['git', 'add', '.'], cwd=output_dir, check=True)
+        subprocess.run(['git', 'commit', '-m', commit_msg], 
+                      cwd=output_dir, check=True)
+        return {"status": "Repository cloned and committed"}
+    except subprocess.CalledProcessError as e:
+        return {"error": f"Git operation failed: {str(e)}"}
+
+def handle_task_B3(database_file: str, query: str, output_file: str, is_sqlite: bool = True):
+    """Execute SQL query and save results"""
+    try:
+        if is_sqlite:
+            conn = sqlite3.connect(database_file)
+        else:
+            conn = duckdb.connect(database_file)
+            
+        cursor = conn.cursor()
+        cursor.execute(query)
+        result = cursor.fetchall()
+        
+        with open(output_file, 'w') as f:
+            for row in result:
+                f.write(str(row) + '\n')
+                
+        return {"status": "Query executed successfully"}
+    except Exception as e:
+        return {"error": str(e)}
+    finally:
+        conn.close()
+
+def handle_task_B4(url: str, output_file: str):
+    """Scrape webpage content"""
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        with open(output_file, 'w') as f:
+            f.write(response.text)
+        return {"status": "Webpage scraped successfully"}
+    except Exception as e:
+        return {"error": str(e)}
 def parse_task_with_llm(task: str) -> dict:
     """
     Uses GPT-4o-Mini via the AI Proxy to parse the plain-English task and extract a structured task code.
@@ -699,7 +784,7 @@ def parse_task_with_llm(task: str) -> dict:
     prompt = (
         "You are a task parser for DataWorks Solutions. Below are the explicit mappings of task descriptions to task codes:\n\n"
         "A1: 'Install uv (if required) and run datagen.py with ${user.email} as the only argument'\n"
-        "A2: 'Format the contents of /data/format.md using prettier@3.4.2, updating the file in-place'\n"
+        "A2: 'Format the contents of data/format.md using prettier@3.4.2, updating the file in-place'\n"
         "A3: 'The file /data/dates.txt contains a list of dates, one per line. Count the number of Wednesdays and write just the number to /data/dates-wednesdays.txt'\n"
         "A4: 'Sort the array of contacts in /data/contacts.json by last_name, then first_name, and write the result to /data/contacts-sorted.json'\n"
         "A5: 'Write the first line of the 10 most recent .log files in /data/logs/ to /data/logs-recent.txt, most recent first'\n"
@@ -708,6 +793,10 @@ def parse_task_with_llm(task: str) -> dict:
         "A8: '/data/credit-card.png contains a credit card number. Use an LLM to extract the card number and write it without spaces to /data/credit-card.txt'\n"
         "A9: '/data/comments.txt contains a list of comments, one per line. Using embeddings, find the most similar pair of comments and write them to /data/comments-similar.txt, one per line'\n"
         "A10: 'The SQLite database file /data/ticket-sales.db has a table tickets with columns type, units, and price. Calculate the total sales for the \"Gold\" ticket type and write the number to /data/ticket-sales-gold.txt'\n\n"
+        "B1: 'Fetch data from API using GET/POST and save to JSON'\n"
+        "B2: 'Clone Git repo and make initial commit'\n"
+        "B3: 'Execute SQL query on database and save results'\n"
+        "B4: 'Scrape webpage content and save formatted HTML'\n"
         "Given the following instruction, determine which task code applies. "
         "Return a JSON object with a single key 'task_code' whose value is one of A1, A2, A3, A4, A5, A6, A7, A8, A9, or A10. "
         "If the instruction does not match any known task, return 'UNKNOWN'.\n\n"
